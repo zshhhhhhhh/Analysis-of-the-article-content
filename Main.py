@@ -95,7 +95,12 @@ class QueueConfig:
     max_retries: int = 3
 
     visibility_timeout_sec: float = 300.0   # 超过这么久没 ack/fail，视为 worker 卡死，reaper 回收
+    
     reaper_interval_sec: float = 30.0
+    # 每个 worker 处理多少个任务后重建一次 session（重置 TCP 连接状态）
+    session_recycle_interval: int = 1000
+    # 无论任务数是否达标，session 存活超过多少秒也强制重建（默认 30 分钟）
+    session_recycle_time_interval: float = 30 * 60
 
 CONFIG = QueueConfig()
 
@@ -312,14 +317,26 @@ class WorkerStats:
         with self.lock:
             setattr(self, field_name, getattr(self, field_name) + 1)
 
+def _make_session() -> requests.Session:
+    """创建一个带统一 headers/cookies 的新 session。"""
+    session = requests.Session()
+    session.headers.update(COMMON_HEADERS)
+    session.cookies.update(COMMON_COOKIES)
+    return session
+
 
 def worker_loop(worker_idx: int, tq: TQ, queue: ReliableRedisQueue,
                  stop_event: threading.Event, stats: WorkerStats):
     worker_id = f"worker-{worker_idx}-{uuid.uuid4().hex[:6]}"
-    session = requests.Session()
-    session.headers.update(COMMON_HEADERS)
-    session.cookies.update(COMMON_COOKIES)
+    session = _make_session()
     logger.info(f"worker 启动: {worker_id}")
+
+    # 用于周期性重建 session 的计数器 / 计时器
+    cfg = queue.cfg
+    tasks_since_recycle = 0
+    recycle_interval = cfg.session_recycle_interval
+    recycle_time_interval = cfg.session_recycle_time_interval
+    last_recycle_ts = time.time()
 
     while not stop_event.is_set():
         task = queue.pop(worker_id)
